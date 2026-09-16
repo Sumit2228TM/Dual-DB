@@ -2,8 +2,10 @@ import os
 import csv
 import logging
 import smtplib
+import threading
 from datetime import datetime
 from email.message import EmailMessage
+from concurrent.futures import ThreadPoolExecutor
 
 import mysql.connector
 from dotenv import load_dotenv
@@ -21,8 +23,12 @@ OUTPUT_FILE = os.path.join(
     "openspecimen_table_comparison.csv",
 )
 
+_thread_local = threading.local()
+
+
 class ReplicationError(RuntimeError):
     pass
+
 
 def require_env(name: str) -> str:
     value = os.getenv(name)
@@ -106,9 +112,57 @@ def check_replication_status(cursor2) -> dict:
     }
 
 
-def compare_tables(cursor1, cursor2, db1_name: str, db2_name: str):
-    tables_db1 = set(get_tables(cursor1, db1_name))
-    tables_db2 = set(get_tables(cursor2, db2_name))
+def get_thread_connections(db1_cfg: dict, db2_cfg: dict):
+    if not hasattr(_thread_local, "conns"):
+        conn1 = mysql.connector.connect(**db1_cfg)
+        conn2 = mysql.connector.connect(**db2_cfg)
+        _thread_local.conns = (conn1, conn2)
+    return _thread_local.conns
+
+
+def close_thread_connections():
+    if hasattr(_thread_local, "conns"):
+        conn1, conn2 = _thread_local.conns
+        try:
+            conn1.close()
+        except Exception:
+            pass
+        try:
+            conn2.close()
+        except Exception:
+            pass
+        del _thread_local.conns
+
+
+def process_table_count(table: str, db1_cfg: dict, db2_cfg: dict, tables_db1: set, tables_db2: set) -> tuple:
+    conn1, conn2 = get_thread_connections(db1_cfg, db2_cfg)
+    count_db1 = None
+    count_db2 = None
+
+    if table in tables_db1:
+        with conn1.cursor() as cur1:
+            count_db1 = get_table_count(cur1, table)
+
+    if table in tables_db2:
+        with conn2.cursor() as cur2:
+            count_db2 = get_table_count(cur2, table)
+
+    matches = (
+        count_db1 is not None
+        and count_db2 is not None
+        and count_db1 == count_db2
+    )
+    comparison = "Matching" if matches else "Not Matching"
+    return [table, count_db1, count_db2, comparison], table if not matches else None
+
+
+def worker_initializer(db1_cfg: dict, db2_cfg: dict):
+    get_thread_connections(db1_cfg, db2_cfg)
+
+
+def compare_tables(db1_cfg: dict, db2_cfg: dict, cursor1, cursor2):
+    tables_db1 = set(get_tables(cursor1, db1_cfg["database"]))
+    tables_db2 = set(get_tables(cursor2, db2_cfg["database"]))
     all_tables = sorted(tables_db1 | tables_db2)
 
     log.info("Total tables found across both DBs: %d", len(all_tables))
@@ -116,21 +170,25 @@ def compare_tables(cursor1, cursor2, db1_name: str, db2_name: str):
     results = []
     mismatched_tables = []
 
-    for table in all_tables:
-        count_db1 = get_table_count(cursor1, table) if table in tables_db1 else None
-        count_db2 = get_table_count(cursor2, table) if table in tables_db2 else None
+    max_workers = 8
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        initializer=worker_initializer,
+        initargs=(db1_cfg, db2_cfg),
+    ) as executor:
+        futures = [
+            executor.submit(process_table_count, table, db1_cfg, db2_cfg, tables_db1, tables_db2)
+            for table in all_tables
+        ]
+        for future in futures:
+            res, mismatch = future.result()
+            results.append(res)
+            if mismatch:
+                mismatched_tables.append(mismatch)
 
-        matches = (
-            count_db1 is not None
-            and count_db2 is not None
-            and count_db1 == count_db2
-        )
-        comparison = "Matching" if matches else "Not Matching"
-        if not matches:
-            mismatched_tables.append(table)
+        executor.map(lambda _: close_thread_connections(), range(max_workers))
 
-        results.append([table, count_db1, count_db2, comparison])
-
+    results.sort(key=lambda x: x[0])
     return results, mismatched_tables
 
 
@@ -142,8 +200,11 @@ def write_csv(results: list, path: str) -> None:
     log.info("CSV written to %s", path)
 
 
-def build_email_body(mismatch_count: int) -> str:
-    status_line = "Replication Status: Healthy\n\n"
+def build_email_body(mismatch_count: int, lag_seconds: int = None) -> str:
+    status_line = "Replication Status: Healthy\n"
+    if lag_seconds is not None and lag_seconds > 0:
+        status_line += f"Replication Lag: {lag_seconds} seconds\n"
+    status_line += "\n"
 
     if mismatch_count == 0:
         return (
@@ -207,10 +268,9 @@ def send_failure_alert(smtp_cfg: dict, error: Exception) -> None:
         server.send_message(msg)
 
 
-def main() -> None:
+def main(smtp_cfg: dict) -> None:
     db1_cfg = load_db_config("DB1")
     db2_cfg = load_db_config("DB2")
-    smtp_cfg = load_smtp_config()
 
     log.info("Connecting to Production database...")
     log.info("Connecting to Reporting database...")
@@ -229,7 +289,7 @@ def main() -> None:
                 )
 
                 results, mismatched = compare_tables(
-                    cursor1, cursor2, db1_cfg["database"], db2_cfg["database"]
+                    db1_cfg, db2_cfg, cursor1, cursor2
                 )
     except mysql.connector.Error as exc:
         log.error("Database error: %s", exc)
@@ -241,7 +301,7 @@ def main() -> None:
     today = datetime.now().strftime("%d/%m/%Y")
     status = "Success" if mismatch_count == 0 else "Failure"
 
-    body = build_email_body(mismatch_count)
+    body = build_email_body(mismatch_count, lag_seconds=repl_status.get("lag_seconds"))
     subject = f"Replication status on {today}: {status}"
 
     try:
@@ -258,13 +318,15 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    smtp_cfg = None
     try:
-        main()
+        smtp_cfg = load_smtp_config()
+        main(smtp_cfg)
     except Exception as exc:
-        log.error("Validation run failed: %s", exc)
-        try:
-            smtp_cfg = load_smtp_config()
-            send_failure_alert(smtp_cfg, exc)
-        except Exception as alert_exc:
-            log.error("Also failed to send failure alert: %s", alert_exc)
+        log.error("Validation run failed: %s", exc, exc_info=True)
+        if smtp_cfg:
+            try:
+                send_failure_alert(smtp_cfg, exc)
+            except Exception as alert_exc:
+                log.error("Also failed to send failure alert: %s", alert_exc)
         raise
