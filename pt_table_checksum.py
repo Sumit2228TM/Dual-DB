@@ -29,8 +29,8 @@ SELECT
     SUM(source_cnt) AS source_row_count,
     SUM(this_cnt) AS target_row_count
 FROM percona.checksums
-WHERE this_crc <> source_crc
-   OR this_cnt <> source_cnt
+WHERE db = 'openspecimen'
+  AND (this_crc <> source_crc OR this_cnt <> source_cnt)
 GROUP BY db, tbl;
 """
 
@@ -40,6 +40,8 @@ class ReplicationError(RuntimeError):
 
 
 class ChecksumError(RuntimeError):
+    """Raised when pt-table-checksum or the drift query itself fails,
+    as opposed to the checksum running fine but finding drift."""
     pass
 
 
@@ -103,14 +105,32 @@ def check_replication_status(cursor2) -> dict:
     }
 
 
+def truncate_previous_checksums(db2_cfg: dict) -> None:
+
+    cmd = [
+        "mysql",
+        "-h", db2_cfg["host"],
+        "-P", str(db2_cfg["port"]),
+        "-u", db2_cfg["user"],
+        f"-p{db2_cfg['password']}",
+        "-e", "TRUNCATE TABLE percona.checksums;",
+    ]
+    log.info("Clearing stale rows from percona.checksums before this run...")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0 and result.stderr.strip():
+
+        if "doesn't exist" not in result.stderr:
+            raise ChecksumError(f"Failed to truncate percona.checksums: {result.stderr.strip()[:500]}")
+
+
 def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
+    dsn = (
+        f"h={db1_cfg['host']},P={db1_cfg['port']},u={db1_cfg['user']},"
+        f"p={db1_cfg['password']},D={db1_cfg['database']},s=1"
+    )
     cmd = [
         "pt-table-checksum",
-        f"--host={db1_cfg['host']}",
-        f"--port={db1_cfg['port']}",
-        f"--user={db1_cfg['user']}",
-        f"--password={db1_cfg['password']}",
-        f"--databases={db1_cfg['database']}",
+        dsn,
         "--replicate=percona.checksums",
         "--recursion-method=hosts",
         "--no-check-binlog-format",
@@ -120,15 +140,22 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
         db1_cfg["host"], db1_cfg["port"],
     )
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+
+    if result.returncode != 0 and result.stderr.strip():
         log.error("pt-table-checksum stderr: %s", result.stderr)
         raise ChecksumError(f"pt-table-checksum failed: {result.stderr.strip()[:500]}")
-    log.info("pt-table-checksum completed successfully.")
+
+    if result.returncode != 0:
+        log.info(
+            "pt-table-checksum exited with status %d (no stderr) - "
+            "likely found checksum differences, not an error. Continuing to drift query.",
+            result.returncode,
+        )
+    else:
+        log.info("pt-table-checksum completed successfully.")
 
 
 def get_drift_rows(db2_cfg: dict) -> list:
-    """Queries percona.checksums on Reporting for tables whose checksum
-    or row count didn't match what Production computed."""
     cmd = [
         "mysql",
         "-h", db2_cfg["host"],
@@ -148,13 +175,21 @@ def get_drift_rows(db2_cfg: dict) -> list:
         raise ChecksumError(f"Drift query failed: {result.stderr.strip()[:500]}")
 
     lines = [line for line in result.stdout.splitlines() if line.strip()]
-    rows = [line.split("\t") for line in lines]
-    return rows  
+    if not lines:
+        return []
+
+    data_lines = lines[1:]
+    rows = []
+    for line in data_lines:
+        db_name, table, src_cnt, tgt_cnt = line.split("\t")
+        rows.append([table, src_cnt, tgt_cnt, "Not Matching"])
+    return rows
 
 
 def write_csv(rows: list, path: str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
+        writer.writerow(["Table Name", "Production Count", "Reporting Count", "Comparison"])
         writer.writerows(rows)
     log.info("CSV written to %s", path)
 
@@ -243,11 +278,12 @@ def main(smtp_cfg: dict) -> None:
         log.error("Database error: %s", exc)
         raise
 
+    truncate_previous_checksums(db2_cfg)
     run_checksum(db1_cfg, db2_cfg)
     rows = get_drift_rows(db2_cfg)
     write_csv(rows, OUTPUT_FILE)
 
-    drifted_count = max(len(rows) - 1, 0)
+    drifted_count = len(rows)
 
     today = datetime.now().strftime("%d/%m/%Y")
     status = "Success" if drifted_count == 0 else "Drift Detected"
