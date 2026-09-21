@@ -29,7 +29,7 @@ SELECT
     SUM(source_cnt) AS source_row_count,
     SUM(this_cnt) AS target_row_count
 FROM percona.checksums
-WHERE db = 'openspecimen'
+WHERE db = 'indiana_prod'
   AND (this_crc <> source_crc OR this_cnt <> source_cnt)
 GROUP BY db, tbl;
 """
