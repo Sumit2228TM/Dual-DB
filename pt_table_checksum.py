@@ -126,7 +126,7 @@ def truncate_previous_checksums(db2_cfg: dict) -> None:
 def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
     dsn = (
         f"h={db1_cfg['host']},P={db1_cfg['port']},u={db1_cfg['user']},"
-        f"p={db1_cfg['password']},D={db1_cfg['database']}"
+        f"p={db1_cfg['password']},D={db1_cfg['database'],s=1}"
     )
     cmd = [
         "pt-table-checksum",
