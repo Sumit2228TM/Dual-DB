@@ -3,13 +3,15 @@ import csv
 import logging
 import smtplib
 import subprocess
+from pathlib import Path
 from datetime import datetime
 from email.message import EmailMessage
 
 import mysql.connector
 from dotenv import load_dotenv
 
-load_dotenv()
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +31,7 @@ SELECT
     SUM(source_cnt) AS source_row_count,
     SUM(this_cnt) AS target_row_count
 FROM percona.checksums
-WHERE db = 'indiana_prod'
+WHERE db = 'openspecimen'
   AND (this_crc <> source_crc OR this_cnt <> source_cnt)
 GROUP BY db, tbl;
 """
@@ -40,20 +42,25 @@ class ReplicationError(RuntimeError):
 
 
 class ChecksumError(RuntimeError):
-    """Raised when pt-table-checksum or the drift query itself fails,
-    as opposed to the checksum running fine but finding drift."""
+    pass
+
+
+class ConfigError(RuntimeError):
     pass
 
 
 def require_env(name: str) -> str:
     value = os.getenv(name)
-    if value is None or value == "":
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+    if value is None or value.strip() == "":
+        raise ConfigError(
+            f"Missing or empty required environment variable: {name}. "
+            f"Checked .env at: {ENV_PATH} (exists: {ENV_PATH.exists()})"
+        )
+    return value.strip()
 
 
 def load_db_config(prefix: str) -> dict:
-    return {
+    cfg = {
         "host": require_env(f"{prefix}_HOST"),
         "port": int(require_env(f"{prefix}_PORT")),
         "user": require_env(f"{prefix}_USER"),
@@ -62,13 +69,19 @@ def load_db_config(prefix: str) -> dict:
         "connection_timeout": 10,
     }
 
+    log.info(
+        "%s config loaded -> host=%s port=%s user=%s database=%s",
+        prefix, cfg["host"], cfg["port"], cfg["user"], cfg["database"],
+    )
+    return cfg
+
 
 def load_smtp_config() -> dict:
     recipients = [
         e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").split(",") if e.strip()
     ]
     if not recipients:
-        raise RuntimeError("No RECIPIENT_EMAILS configured")
+        raise ConfigError("No RECIPIENT_EMAILS configured")
     return {
         "server": require_env("SMTP_SERVER"),
         "port": int(require_env("SMTP_PORT")),
@@ -106,7 +119,6 @@ def check_replication_status(cursor2) -> dict:
 
 
 def truncate_previous_checksums(db2_cfg: dict) -> None:
-
     cmd = [
         "mysql",
         "-h", db2_cfg["host"],
@@ -118,15 +130,18 @@ def truncate_previous_checksums(db2_cfg: dict) -> None:
     log.info("Clearing stale rows from percona.checksums before this run...")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0 and result.stderr.strip():
-
         if "doesn't exist" not in result.stderr:
             raise ChecksumError(f"Failed to truncate percona.checksums: {result.stderr.strip()[:500]}")
 
 
 def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
+
+    if not db1_cfg.get("host"):
+        raise ConfigError("db1_cfg['host'] is empty - check DB1_HOST in .env")
+
     dsn = (
         f"h={db1_cfg['host']},P={db1_cfg['port']},u={db1_cfg['user']},"
-        f"p={db1_cfg['password']},D={db1_cfg['database'],s=1}"
+        f"p={db1_cfg['password']},D={db1_cfg['database']},s=1"
     )
     cmd = [
         "pt-table-checksum",
@@ -156,6 +171,7 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
 
 
 def get_drift_rows(db2_cfg: dict) -> list:
+
     cmd = [
         "mysql",
         "-h", db2_cfg["host"],
@@ -238,11 +254,13 @@ def send_email(smtp_cfg: dict, subject: str, body: str, attachment_path: str) ->
 
 def send_failure_alert(smtp_cfg: dict, error: Exception) -> None:
     today = datetime.now().strftime("%d/%m/%Y")
-    status_line = (
-        "Replication Status: Broken\n\n"
-        if isinstance(error, ReplicationError)
-        else "Replication Status: Unknown\n\n"
-    )
+    if isinstance(error, ReplicationError):
+        status_line = "Replication Status: Broken\n\n"
+    elif isinstance(error, ConfigError):
+        status_line = "Replication Status: Unknown (configuration problem, not a DB issue)\n\n"
+    else:
+        status_line = "Replication Status: Unknown\n\n"
+
     msg = EmailMessage()
     msg["Subject"] = f"Checksum drift check FAILED on {today}"
     msg["From"] = smtp_cfg["sender"]
