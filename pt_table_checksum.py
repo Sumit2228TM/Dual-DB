@@ -10,11 +10,6 @@ from email.message import EmailMessage
 import mysql.connector
 from dotenv import load_dotenv
 
-# Load .env explicitly from the script's own directory. load_dotenv() with
-# no path only searches the current working directory upward - if this
-# script runs from cron, sudo, or any different cwd, that search can find
-# nothing and silently fall back to whatever (possibly empty) values
-# already exist in the environment, instead of erroring loudly.
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
@@ -47,15 +42,10 @@ class ReplicationError(RuntimeError):
 
 
 class ChecksumError(RuntimeError):
-    """Raised when pt-table-checksum or the drift query itself fails,
-    as opposed to the checksum running fine but finding drift."""
     pass
 
 
 class ConfigError(RuntimeError):
-    """Raised when a required config value is missing or empty, caught
-    separately from ReplicationError/ChecksumError so the failure email
-    correctly says 'configuration problem', not 'replication broken'."""
     pass
 
 
@@ -78,9 +68,7 @@ def load_db_config(prefix: str) -> dict:
         "database": require_env(f"{prefix}_DATABASE"),
         "connection_timeout": 10,
     }
-    # Log everything except the password, so a bad/missing value is
-    # visible immediately in the run log rather than discovered later
-    # inside a cryptic pt-table-checksum DSN error.
+
     log.info(
         "%s config loaded -> host=%s port=%s user=%s database=%s",
         prefix, cfg["host"], cfg["port"], cfg["user"], cfg["database"],
@@ -147,12 +135,7 @@ def truncate_previous_checksums(db2_cfg: dict) -> None:
 
 
 def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
-    """Runs pt-table-checksum against DB1 (Production), replicating the
-    checksum writes down to DB2 (Reporting) via the replication link
-    itself - this is the actual replicated comparison, not an estimate."""
-    # Defensive check: fail with a clear message here rather than letting
-    # an empty host silently produce a confusing DBI connect error deep
-    # inside pt-table-checksum's own output.
+
     if not db1_cfg.get("host"):
         raise ConfigError("db1_cfg['host'] is empty - check DB1_HOST in .env")
     if not db2_cfg.get("host"):
@@ -179,10 +162,6 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
     )
     result = subprocess.run(cmd, capture_output=True, text=True)
 
-    # pt-table-checksum exits non-zero not just on real errors, but also
-    # whenever it finds checksum differences between source and replica -
-    # that is expected, successful behavior, not a failure. Only treat
-    # this as a genuine ChecksumError if stderr actually has content.
     if result.returncode != 0 and result.stderr.strip():
         log.error("pt-table-checksum stderr: %s", result.stderr)
         raise ChecksumError(f"pt-table-checksum failed: {result.stderr.strip()[:500]}")
@@ -198,9 +177,7 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
 
 
 def get_drift_rows(db2_cfg: dict) -> list:
-    """Queries percona.checksums on Reporting for tables whose checksum
-    or row count didn't match what Production computed. Returns clean
-    rows: [table, prod_count, reporting_count, comparison]."""
+
     cmd = [
         "mysql",
         "-h", db2_cfg["host"],
