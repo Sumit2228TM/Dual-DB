@@ -68,6 +68,7 @@ def load_db_config(prefix: str) -> dict:
         "database": require_env(f"{prefix}_DATABASE"),
         "connection_timeout": 10,
     }
+
     log.info(
         "%s config loaded -> host=%s port=%s user=%s database=%s",
         prefix, cfg["host"], cfg["port"], cfg["user"], cfg["database"],
@@ -144,6 +145,10 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
         f"h={db1_cfg['host']},P={db1_cfg['port']},u={db1_cfg['user']},"
         f"p={db1_cfg['password']},D={db1_cfg['database']},s=1"
     )
+    replica_dsn = (
+        f"h={db2_cfg['host']},P={db2_cfg['port']},u={db2_cfg['user']},"
+        f"p={db2_cfg['password']},D={db2_cfg['database']},s=1"
+    )
     cmd = [
         "pt-table-checksum",
         dsn,
@@ -172,6 +177,7 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
 
 
 def get_drift_rows(db2_cfg: dict) -> list:
+
     cmd = [
         "mysql",
         "-h", db2_cfg["host"],
