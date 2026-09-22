@@ -244,20 +244,67 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
-    if result.returncode != 0 and result.stderr.strip():
-        log.error("pt-table-checksum stderr: %s", result.stderr)
+    if result.returncode == 0:
+        log.info("pt-table-checksum completed successfully.")
+        return
+
+    if result.returncode == 255:
+        log.error("pt-table-checksum actual fatal error: %s", result.stderr)
         raise ChecksumError(
-            f"pt-table-checksum failed: {result.stderr.strip()[:500]}"
+            f"pt-table-checksum failed with fatal error (exit status 255)"
         )
 
-    if result.returncode != 0:
+    actual_error_flags = 1 | 2 | 4 | 8 | 128
+
+    if result.returncode & actual_error_flags:
+        log.error(
+            "pt-table-checksum actual error (exit status %d): %s",
+            result.returncode,
+            result.stderr,
+        )
+        raise ChecksumError(
+            f"pt-table-checksum failed with actual error "
+            f"(exit status {result.returncode})"
+        )
+
+    non_fatal_flags = 16 | 32 | 64
+
+    if result.returncode & non_fatal_flags:
+        if result.returncode & 16:
+            log.warning(
+                "pt-table-checksum found checksum differences. "
+                "Continuing to drift query."
+            )
+
+        if result.returncode & 32:
+            log.warning(
+                "pt-table-checksum skipped one or more chunks because they were "
+                "oversized or otherwise skipped. Continuing to drift query."
+            )
+
+        if result.returncode & 64:
+            log.warning(
+                "pt-table-checksum skipped one or more tables. "
+                "Continuing to drift query."
+            )
+
         log.info(
-            "pt-table-checksum exited with status %d (no stderr) - "
-            "likely found checksum differences, not an error. Continuing to drift query.",
+            "pt-table-checksum returned non-fatal exit status %d. "
+            "Continuing to drift query.",
             result.returncode,
         )
-    else:
-        log.info("pt-table-checksum completed successfully.")
+        return
+
+    log.error(
+        "pt-table-checksum returned unexpected exit status %d: %s",
+        result.returncode,
+        result.stderr,
+    )
+
+    raise ChecksumError(
+        f"pt-table-checksum failed with unexpected exit status "
+        f"{result.returncode}"
+    )
 
 
 def get_drift_rows(db2_cfg: dict) -> list:
