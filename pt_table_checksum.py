@@ -32,6 +32,7 @@ OPS_RESOURCE_NAME = "jdbc/openspecimen"
 REPORTING_RESOURCE_NAME = "openspecimen_reporting"
 
 DATABASE_NAME = "indiana_prod"
+DB_USER = "admin"
 
 IGNORE_TABLES_REGEX = "_aud$"
 
@@ -122,12 +123,11 @@ def load_db_config_from_tomcat(resource_name: str) -> dict:
         )
 
     url = resource.get("url")
-    user = resource.get("username")
     password = resource.get("password")
 
-    if url is None or user is None or password is None:
+    if url is None or password is None:
         raise ConfigError(
-            f"<Resource name=\"{resource_name}\"> is missing url/username/password "
+            f"<Resource name=\"{resource_name}\"> is missing url/password "
             f"in {CONTEXT_XML_PATH}"
         )
 
@@ -136,7 +136,7 @@ def load_db_config_from_tomcat(resource_name: str) -> dict:
     cfg = {
         "host": host,
         "port": port,
-        "user": user,
+        "user": DB_USER,
         "password": password,
         "database": DATABASE_NAME,
         "connection_timeout": 10,
