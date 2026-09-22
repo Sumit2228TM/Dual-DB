@@ -3,9 +3,11 @@ import csv
 import logging
 import smtplib
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
 from email.message import EmailMessage
+from urllib.parse import urlparse
 
 import mysql.connector
 from dotenv import load_dotenv
@@ -24,14 +26,23 @@ OUTPUT_FILE = os.path.join(
     "openspecimen_table_comparison.csv",
 )
 
-DRIFT_QUERY = """
+CONTEXT_XML_PATH = "/usr/local/openspecimen/os-prod/tomcat-as/conf/context.xml"
+
+OPS_RESOURCE_NAME = "jdbc/openspecimen"
+REPORTING_RESOURCE_NAME = "openspecimen_reporting"
+
+DATABASE_NAME = "indiana_prod"
+
+IGNORE_TABLES_REGEX = "_aud$"
+
+DRIFT_QUERY = f"""
 SELECT
     db AS database_name,
     tbl AS out_of_sync_table,
     SUM(source_cnt) AS source_row_count,
     SUM(this_cnt) AS target_row_count
 FROM percona.checksums
-WHERE db = 'indiana_prod'
+WHERE db = '{DATABASE_NAME}'
   AND (this_crc <> source_crc OR this_cnt <> source_cnt)
 GROUP BY db, tbl;
 """
@@ -59,23 +70,6 @@ def require_env(name: str) -> str:
     return value.strip()
 
 
-def load_db_config(prefix: str) -> dict:
-    cfg = {
-        "host": require_env(f"{prefix}_HOST"),
-        "port": int(require_env(f"{prefix}_PORT")),
-        "user": require_env(f"{prefix}_USER"),
-        "password": require_env(f"{prefix}_PASSWORD"),
-        "database": require_env(f"{prefix}_DATABASE"),
-        "connection_timeout": 10,
-    }
-
-    log.info(
-        "%s config loaded -> host=%s port=%s user=%s database=%s",
-        prefix, cfg["host"], cfg["port"], cfg["user"], cfg["database"],
-    )
-    return cfg
-
-
 def load_smtp_config() -> dict:
     recipients = [
         e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").split(",") if e.strip()
@@ -90,6 +84,68 @@ def load_smtp_config() -> dict:
         "sender": require_env("SENDER_EMAIL"),
         "recipients": recipients,
     }
+
+
+def parse_jdbc_url(url: str) -> tuple:
+    if not url.startswith("jdbc:mysql://"):
+        raise ConfigError(f"Unexpected JDBC URL format (missing jdbc:mysql:// prefix): {url}")
+
+    stripped = url[len("jdbc:"):]
+    parsed = urlparse(stripped)
+
+    host = parsed.hostname
+    port = parsed.port or 3306
+
+    if not host:
+        raise ConfigError(f"Could not parse host from JDBC URL: {url}")
+
+    return host, port
+
+
+def load_db_config_from_tomcat(resource_name: str) -> dict:
+    context_path = Path(CONTEXT_XML_PATH)
+    if not context_path.exists():
+        raise ConfigError(f"context.xml not found at {CONTEXT_XML_PATH}")
+
+    tree = ET.parse(context_path)
+    root = tree.getroot()
+
+    resource = None
+    for elem in root.iter("Resource"):
+        if elem.get("name") == resource_name:
+            resource = elem
+            break
+
+    if resource is None:
+        raise ConfigError(
+            f"No <Resource name=\"{resource_name}\"> found in {CONTEXT_XML_PATH}"
+        )
+
+    url = resource.get("url")
+    user = resource.get("username")
+    password = resource.get("password")
+
+    if url is None or user is None or password is None:
+        raise ConfigError(
+            f"<Resource name=\"{resource_name}\"> is missing url/username/password "
+            f"in {CONTEXT_XML_PATH}"
+        )
+
+    host, port = parse_jdbc_url(url)
+
+    cfg = {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+        "database": DATABASE_NAME,
+        "connection_timeout": 10,
+    }
+    log.info(
+        "Loaded config for resource '%s' -> host=%s port=%s user=%s database=%s",
+        resource_name, cfg["host"], cfg["port"], cfg["user"], cfg["database"],
+    )
+    return cfg
 
 
 def check_replication_status(cursor2) -> dict:
@@ -135,19 +191,14 @@ def truncate_previous_checksums(db2_cfg: dict) -> None:
 
 
 def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
-
     if not db1_cfg.get("host"):
-        raise ConfigError("db1_cfg['host'] is empty - check DB1_HOST in .env")
+        raise ConfigError("db1_cfg['host'] is empty - check the ops Resource in context.xml")
     if not db2_cfg.get("host"):
-        raise ConfigError("db2_cfg['host'] is empty - check DB2_HOST in .env")
+        raise ConfigError("db2_cfg['host'] is empty - check the reporting Resource in context.xml")
 
     dsn = (
         f"h={db1_cfg['host']},P={db1_cfg['port']},u={db1_cfg['user']},"
-        f"p={db1_cfg['password']},D={db1_cfg['database']},s=1"
-    )
-    replica_dsn = (
-        f"h={db2_cfg['host']},P={db2_cfg['port']},u={db2_cfg['user']},"
-        f"p={db2_cfg['password']},D={db2_cfg['database']},s=1"
+        f"p={db1_cfg['password']},D={DATABASE_NAME},s=1"
     )
     cmd = [
         "pt-table-checksum",
@@ -155,10 +206,11 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
         "--replicate=percona.checksums",
         "--recursion-method=none",
         "--no-check-binlog-format",
+        f"--ignore-tables-regex={IGNORE_TABLES_REGEX}",
     ]
     log.info(
-        "Running pt-table-checksum against Production (%s:%s)...",
-        db1_cfg["host"], db1_cfg["port"],
+        "Running pt-table-checksum against Production (%s:%s), skipping tables matching '%s'...",
+        db1_cfg["host"], db1_cfg["port"], IGNORE_TABLES_REGEX,
     )
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -177,7 +229,6 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
 
 
 def get_drift_rows(db2_cfg: dict) -> list:
-
     cmd = [
         "mysql",
         "-h", db2_cfg["host"],
@@ -285,8 +336,8 @@ def send_failure_alert(smtp_cfg: dict, error: Exception) -> None:
 
 
 def main(smtp_cfg: dict) -> None:
-    db1_cfg = load_db_config("DB1")
-    db2_cfg = load_db_config("DB2")
+    db1_cfg = load_db_config_from_tomcat(OPS_RESOURCE_NAME)
+    db2_cfg = load_db_config_from_tomcat(REPORTING_RESOURCE_NAME)
 
     log.info("Connecting to Reporting database to check replication status...")
 
