@@ -12,10 +12,8 @@ from urllib.parse import urlparse
 import mysql.connector
 from dotenv import load_dotenv
 
-
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,12 +22,10 @@ logging.basicConfig(
 
 log = logging.getLogger(__name__)
 
-
 OUTPUT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "openspecimen_table_comparison.csv",
 )
-
 
 CONTEXT_XML_PATH = "/usr/local/openspecimen/os-prod/tomcat-as/conf/context.xml"
 
@@ -39,17 +35,19 @@ REPORTING_RESOURCE_NAME = "openspecimen_reporting"
 DATABASE_NAME = "indiana_prod"
 DB_USER = "admin"
 
-
 DRIFT_QUERY = f"""
 SELECT
-    db AS database_name,
-    tbl AS table_name,
-    SUM(source_cnt) AS source_row_count,
-    SUM(this_cnt) AS target_row_count,
+    t.TABLE_SCHEMA AS database_name,
+    t.TABLE_NAME AS table_name,
+    SUM(c.source_cnt) AS source_row_count,
+    SUM(c.this_cnt) AS target_row_count,
     CASE
+        WHEN COUNT(c.tbl) = 0
+        THEN 'Skipped'
         WHEN SUM(
             CASE
-                WHEN this_crc <> source_crc OR this_cnt <> source_cnt
+                WHEN c.this_crc <> c.source_crc
+                     OR c.this_cnt <> c.source_cnt
                 THEN 1
                 ELSE 0
             END
@@ -57,9 +55,17 @@ SELECT
         THEN 'Not Matching'
         ELSE 'Matching'
     END AS comparison
-FROM percona.checksums
-WHERE db = '{DATABASE_NAME}'
-GROUP BY db, tbl;
+FROM information_schema.tables t
+LEFT JOIN percona.checksums c
+    ON c.db = t.TABLE_SCHEMA
+   AND c.tbl = t.TABLE_NAME
+WHERE t.TABLE_SCHEMA = '{DATABASE_NAME}'
+  AND t.TABLE_TYPE = 'BASE TABLE'
+GROUP BY
+    t.TABLE_SCHEMA,
+    t.TABLE_NAME
+ORDER BY
+    t.TABLE_NAME;
 """
 
 
@@ -77,21 +83,17 @@ class ConfigError(RuntimeError):
 
 def require_env(name: str) -> str:
     value = os.getenv(name)
-
     if value is None or value.strip() == "":
         raise ConfigError(
             f"Missing or empty required environment variable: {name}. "
             f"Checked .env at: {ENV_PATH} (exists: {ENV_PATH.exists()})"
         )
-
     return value.strip()
 
 
 def load_smtp_config() -> dict:
     recipients = [
-        e.strip()
-        for e in os.getenv("RECIPIENT_EMAILS", "").split(",")
-        if e.strip()
+        e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").split(",") if e.strip()
     ]
 
     if not recipients:
@@ -215,9 +217,7 @@ def truncate_previous_checksums(db1_cfg: dict) -> None:
         "-e", "TRUNCATE TABLE percona.checksums;",
     ]
 
-    log.info(
-        "Clearing stale rows from percona.checksums on Production before this run..."
-    )
+    log.info("Clearing stale rows from percona.checksums on Production before this run...")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -254,7 +254,7 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
     ]
 
     log.info(
-        "Running pt-table-checksum against Production (%s:%s) for all tables...",
+        "Running pt-table-checksum against Production (%s:%s), checking all tables...",
         db1_cfg["host"],
         db1_cfg["port"],
     )
@@ -266,12 +266,9 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
         return
 
     if result.returncode == 255:
-        log.error(
-            "pt-table-checksum actual fatal error: %s",
-            result.stderr
-        )
+        log.error("pt-table-checksum actual fatal error: %s", result.stderr)
         raise ChecksumError(
-            "pt-table-checksum failed with fatal error (exit status 255)"
+            f"pt-table-checksum failed with fatal error (exit status 255)"
         )
 
     actual_error_flags = 1 | 2 | 4 | 8 | 128
@@ -340,7 +337,7 @@ def get_drift_rows(db2_cfg: dict) -> list:
     ]
 
     log.info(
-        "Querying Reporting (%s:%s) percona.checksums for checksum results...",
+        "Querying Reporting (%s:%s) for checksum comparison results...",
         db2_cfg["host"],
         db2_cfg["port"],
     )
@@ -348,16 +345,12 @@ def get_drift_rows(db2_cfg: dict) -> list:
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
-        log.error("Checksum query stderr: %s", result.stderr)
+        log.error("Drift query stderr: %s", result.stderr)
         raise ChecksumError(
-            f"Checksum query failed: {result.stderr.strip()[:500]}"
+            f"Drift query failed: {result.stderr.strip()[:500]}"
         )
 
-    lines = [
-        line
-        for line in result.stdout.splitlines()
-        if line.strip()
-    ]
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
 
     if not lines:
         return []
@@ -368,9 +361,12 @@ def get_drift_rows(db2_cfg: dict) -> list:
     for line in data_lines:
         db_name, table, src_cnt, tgt_cnt, comparison = line.split("\t")
 
-        rows.append(
-            [table, src_cnt, tgt_cnt, comparison]
-        )
+        rows.append([
+            table,
+            src_cnt if src_cnt != "NULL" else "",
+            tgt_cnt if tgt_cnt != "NULL" else "",
+            comparison,
+        ])
 
     return rows
 
@@ -378,16 +374,9 @@ def get_drift_rows(db2_cfg: dict) -> list:
 def write_csv(rows: list, path: str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-
         writer.writerow(
-            [
-                "Table Name",
-                "Production Count",
-                "Reporting Count",
-                "Comparison",
-            ]
+            ["Table Name", "Production Count", "Reporting Count", "Comparison"]
         )
-
         writer.writerows(rows)
 
     log.info("CSV written to %s", path)
@@ -408,7 +397,7 @@ def build_email_body(drifted_count: int, lag_seconds) -> str:
             + status_line
             + lag_line
             + "pt-table-checksum found no out-of-sync tables between Production and Reporting.\n"
-            + "See attached CSV for the checksum results.\n"
+            "See attached CSV for details.\n"
         )
 
     return (
@@ -417,7 +406,7 @@ def build_email_body(drifted_count: int, lag_seconds) -> str:
         + lag_line
         + f"pt-table-checksum found {drifted_count} out-of-sync table(s) between "
         "Production and Reporting.\n"
-        + "See attached CSV for the checksum results.\n"
+        "See attached CSV for details.\n"
     )
 
 
@@ -428,11 +417,9 @@ def send_email(
     attachment_path: str,
 ) -> None:
     msg = EmailMessage()
-
     msg["Subject"] = subject
     msg["From"] = smtp_cfg["sender"]
     msg["To"] = ", ".join(smtp_cfg["recipients"])
-
     msg.set_content(body)
 
     with open(attachment_path, "rb") as f:
@@ -449,18 +436,13 @@ def send_email(
         timeout=15,
     ) as server:
         server.starttls()
-
         server.login(
             smtp_cfg["username"],
             smtp_cfg["password"],
         )
-
         server.send_message(msg)
 
-    log.info(
-        "Email sent to %s",
-        ", ".join(smtp_cfg["recipients"])
-    )
+    log.info("Email sent to %s", ", ".join(smtp_cfg["recipients"]))
 
 
 def send_failure_alert(
@@ -471,18 +453,15 @@ def send_failure_alert(
 
     if isinstance(error, ReplicationError):
         status_line = "Replication Status: Broken\n\n"
-
     elif isinstance(error, ConfigError):
         status_line = (
             "Replication Status: Unknown "
             "(configuration problem, not a DB issue)\n\n"
         )
-
     else:
         status_line = "Replication Status: Unknown\n\n"
 
     msg = EmailMessage()
-
     msg["Subject"] = f"Checksum drift check FAILED on {today}"
     msg["From"] = smtp_cfg["sender"]
     msg["To"] = ", ".join(smtp_cfg["recipients"])
@@ -491,8 +470,8 @@ def send_failure_alert(
         "Hello all,\n\n"
         + status_line
         + "The Production/Reporting checksum drift check failed to complete.\n"
-        + f"Error: {error}\n\n"
-        + "No checksum comparison was performed for this run.\n"
+        f"Error: {error}\n\n"
+        "No checksum comparison was performed for this run.\n"
     )
 
     with smtplib.SMTP(
@@ -501,12 +480,10 @@ def send_failure_alert(
         timeout=15,
     ) as server:
         server.starttls()
-
         server.login(
             smtp_cfg["username"],
             smtp_cfg["password"],
         )
-
         server.send_message(msg)
 
 
@@ -514,9 +491,7 @@ def main(smtp_cfg: dict) -> None:
     db1_cfg = load_db_config_from_tomcat(OPS_RESOURCE_NAME)
     db2_cfg = load_db_config_from_tomcat(REPORTING_RESOURCE_NAME)
 
-    log.info(
-        "Connecting to Reporting database to check replication status..."
-    )
+    log.info("Connecting to Reporting database to check replication status...")
 
     try:
         with mysql.connector.connect(**db2_cfg) as conn2:
@@ -535,28 +510,18 @@ def main(smtp_cfg: dict) -> None:
         raise
 
     truncate_previous_checksums(db1_cfg)
-
-    run_checksum(
-        db1_cfg,
-        db2_cfg,
-    )
+    run_checksum(db1_cfg, db2_cfg)
 
     rows = get_drift_rows(db2_cfg)
+    write_csv(rows, OUTPUT_FILE)
 
-    write_csv(
-        rows,
-        OUTPUT_FILE,
+    drifted_count = sum(
+        1 for row in rows
+        if row[3] == "Not Matching"
     )
-
-    drifted_count = len(rows)
 
     today = datetime.now().strftime("%d/%m/%Y")
-
-    status = (
-        "Success"
-        if drifted_count == 0
-        else "Drift Detected"
-    )
+    status = "Success" if drifted_count == 0 else "Drift Detected"
 
     body = build_email_body(
         drifted_count,
@@ -574,10 +539,7 @@ def main(smtp_cfg: dict) -> None:
         )
 
     except smtplib.SMTPException as exc:
-        log.error(
-            "Failed to send email: %s",
-            exc,
-        )
+        log.error("Failed to send email: %s", exc)
         raise
 
     log.info(
@@ -591,7 +553,6 @@ if __name__ == "__main__":
 
     try:
         smtp_cfg = load_smtp_config()
-
         main(smtp_cfg)
 
     except Exception as exc:
@@ -603,11 +564,7 @@ if __name__ == "__main__":
 
         if smtp_cfg:
             try:
-                send_failure_alert(
-                    smtp_cfg,
-                    exc,
-                )
-
+                send_failure_alert(smtp_cfg, exc)
             except Exception as alert_exc:
                 log.error(
                     "Also failed to send failure alert: %s",
