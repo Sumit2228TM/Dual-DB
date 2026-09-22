@@ -217,7 +217,9 @@ def truncate_previous_checksums(db1_cfg: dict) -> None:
         "-e", "TRUNCATE TABLE percona.checksums;",
     ]
 
-    log.info("Clearing stale rows from percona.checksums on Production before this run...")
+    log.info(
+        "Clearing stale rows from percona.checksums on Production before this run..."
+    )
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -268,10 +270,10 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
     if result.returncode == 255:
         log.error("pt-table-checksum actual fatal error: %s", result.stderr)
         raise ChecksumError(
-            f"pt-table-checksum failed with fatal error (exit status 255)"
+            "pt-table-checksum failed with fatal error (exit status 255)"
         )
 
-    actual_error_flags = 1 | 2 | 4 | 8 | 128
+    actual_error_flags = 2 | 4 | 8 | 128
 
     if result.returncode & actual_error_flags:
         log.error(
@@ -284,9 +286,15 @@ def run_checksum(db1_cfg: dict, db2_cfg: dict) -> None:
             f"(exit status {result.returncode})"
         )
 
-    non_fatal_flags = 16 | 32 | 64
+    non_fatal_flags = 1 | 16 | 32 | 64
 
     if result.returncode & non_fatal_flags:
+        if result.returncode & 1:
+            log.warning(
+                "pt-table-checksum reported a non-fatal error. "
+                "Continuing to drift query."
+            )
+
         if result.returncode & 16:
             log.warning(
                 "pt-table-checksum found checksum differences. "
