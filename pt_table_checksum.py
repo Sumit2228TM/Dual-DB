@@ -27,6 +27,11 @@ OUTPUT_FILE = os.path.join(
     "openspecimen_table_comparison.csv",
 )
 
+LOG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "comparision-script.log",
+)
+
 CONTEXT_XML_PATH = "/usr/local/openspecimen/os-prod/tomcat-as/conf/context.xml"
 
 OPS_RESOURCE_NAME = "jdbc/prod"
@@ -391,30 +396,19 @@ def write_csv(rows: list, path: str) -> None:
 
 
 def build_email_body(drifted_count: int, lag_seconds) -> str:
-    lag_line = (
-        f"Replication lag at time of check: {lag_seconds} seconds.\n\n"
-        if lag_seconds
-        else ""
-    )
-
-    status_line = "Replication Status: Healthy\n\n"
-
     if drifted_count == 0:
         return (
             "Hello all,\n\n"
-            + status_line
-            + lag_line
-            + "pt-table-checksum found no out-of-sync tables between Production and Reporting.\n"
-            "See attached CSV for details.\n"
+            "All checked tables are matching between Production and Reporting.\n\n"
+            "Replication Status: Healthy\n\n"
+            "Please see the attached CSV for the detailed results."
         )
 
     return (
         "Hello all,\n\n"
-        + status_line
-        + lag_line
-        + f"pt-table-checksum found {drifted_count} out-of-sync table(s) between "
-        "Production and Reporting.\n"
-        "See attached CSV for details.\n"
+        f"{drifted_count} table(s) have differences between Production and Reporting.\n\n"
+        "Replication Status: Healthy\n\n"
+        "Please see the attached CSV for the detailed results."
     )
 
 
@@ -457,30 +451,25 @@ def send_failure_alert(
     smtp_cfg: dict,
     error: Exception,
 ) -> None:
-    today = datetime.now().strftime("%d/%m/%Y")
-
-    if isinstance(error, ReplicationError):
-        status_line = "Replication Status: Broken\n\n"
-    elif isinstance(error, ConfigError):
-        status_line = (
-            "Replication Status: Unknown "
-            "(configuration problem, not a DB issue)\n\n"
-        )
-    else:
-        status_line = "Replication Status: Unknown\n\n"
-
     msg = EmailMessage()
-    msg["Subject"] = f"Checksum drift check FAILED on {today}"
+    msg["Subject"] = "IU Database Replication Check - Failed"
     msg["From"] = smtp_cfg["sender"]
     msg["To"] = ", ".join(smtp_cfg["recipients"])
 
     msg.set_content(
         "Hello all,\n\n"
-        + status_line
-        + "The Production/Reporting checksum drift check failed to complete.\n"
+        "The Production and Reporting database check could not be completed successfully.\n\n"
         f"Error: {error}\n\n"
-        "No checksum comparison was performed for this run.\n"
+        "Please see the attached log file for more details."
     )
+
+    with open(LOG_FILE, "rb") as f:
+        msg.add_attachment(
+            f.read(),
+            maintype="text",
+            subtype="plain",
+            filename=os.path.basename(LOG_FILE),
+        )
 
     with smtplib.SMTP(
         smtp_cfg["server"],
@@ -528,15 +517,14 @@ def main(smtp_cfg: dict) -> None:
         if row[3] == "Not Matching"
     )
 
-    today = datetime.now().strftime("%d/%m/%Y")
-    status = "Success" if drifted_count == 0 else "Drift Detected"
+    status = "Success" if drifted_count == 0 else "Differences Found"
 
     body = build_email_body(
         drifted_count,
         repl_status.get("lag_seconds"),
     )
 
-    subject = f"Checksum drift check on {today}: {status}"
+    subject = f"IU Database Replication Check - {status}"
 
     try:
         send_email(
