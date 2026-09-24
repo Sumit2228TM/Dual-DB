@@ -29,7 +29,7 @@ OUTPUT_FILE = os.path.join(
 
 CONTEXT_XML_PATH = "/usr/local/openspecimen/os-prod/tomcat-as/conf/context.xml"
 
-OPS_RESOURCE_NAME = "jdbc/openspecimen"
+OPS_RESOURCE_NAME = "jdbc/prod"
 REPORTING_RESOURCE_NAME = "openspecimen_reporting"
 
 DATABASE_NAME = "indiana_prod"
