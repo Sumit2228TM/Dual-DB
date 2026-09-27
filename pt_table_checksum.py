@@ -15,7 +15,13 @@ from dotenv import load_dotenv
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
+LOG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "comparision-script.log",
+)
+
 logging.basicConfig(
+    filename=LOG_FILE,
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
@@ -25,11 +31,6 @@ log = logging.getLogger(__name__)
 OUTPUT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "openspecimen_table_comparison.csv",
-)
-
-LOG_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "comparision-script.log",
 )
 
 CONTEXT_XML_PATH = "/usr/local/openspecimen/os-prod/tomcat-as/conf/context.xml"
@@ -154,15 +155,25 @@ def load_db_config_from_tomcat(resource_name: str) -> dict:
         )
 
     url = resource.get("url")
-    password = resource.get("password")
 
-    if url is None or password is None:
+    if url is None:
         raise ConfigError(
-            f"<Resource name=\"{resource_name}\"> is missing url/password "
+            f"<Resource name=\"{resource_name}\"> is missing url "
             f"in {CONTEXT_XML_PATH}"
         )
 
     host, port = parse_jdbc_url(url)
+
+    if resource_name == REPORTING_RESOURCE_NAME:
+        password = require_env("REPORTING_DB_PASSWORD")
+    else:
+        password = resource.get("password")
+
+        if password is None:
+            raise ConfigError(
+                f"<Resource name=\"{resource_name}\"> is missing password "
+                f"in {CONTEXT_XML_PATH}"
+            )
 
     cfg = {
         "host": host,
