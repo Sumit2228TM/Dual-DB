@@ -12,13 +12,16 @@ from urllib.parse import urlparse
 import mysql.connector
 from dotenv import load_dotenv
 
+
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
+
 
 LOG_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "comparision-script.log",
 )
+
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -26,12 +29,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
+
 log = logging.getLogger(__name__)
+
 
 OUTPUT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "openspecimen_table_comparison.csv",
 )
+
 
 CONTEXT_XML_PATH = "/usr/local/openspecimen/os-prod/tomcat-as/conf/context.xml"
 
@@ -39,7 +45,10 @@ OPS_RESOURCE_NAME = "jdbc/prod"
 REPORTING_RESOURCE_NAME = "openspecimen_reporting"
 
 DATABASE_NAME = "indiana_prod"
-DB_USER = "admin"
+
+CHECKSUM_DB_USER = require_env("CHECKSUM_DB_USER") if "require_env" in globals() else os.getenv("CHECKSUM_DB_USER")
+CHECKSUM_DB_PASSWORD = os.getenv("CHECKSUM_DB_PASSWORD")
+
 
 DRIFT_QUERY = f"""
 SELECT
@@ -89,17 +98,21 @@ class ConfigError(RuntimeError):
 
 def require_env(name: str) -> str:
     value = os.getenv(name)
+
     if value is None or value.strip() == "":
         raise ConfigError(
             f"Missing or empty required environment variable: {name}. "
             f"Checked .env at: {ENV_PATH} (exists: {ENV_PATH.exists()})"
         )
+
     return value.strip()
 
 
 def load_smtp_config() -> dict:
     recipients = [
-        e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").split(",") if e.strip()
+        e.strip()
+        for e in os.getenv("RECIPIENT_EMAILS", "").split(",")
+        if e.strip()
     ]
 
     if not recipients:
@@ -164,22 +177,11 @@ def load_db_config_from_tomcat(resource_name: str) -> dict:
 
     host, port = parse_jdbc_url(url)
 
-    if resource_name == REPORTING_RESOURCE_NAME:
-        password = require_env("REPORTING_DB_PASSWORD")
-    else:
-        password = resource.get("password")
-
-        if password is None:
-            raise ConfigError(
-                f"<Resource name=\"{resource_name}\"> is missing password "
-                f"in {CONTEXT_XML_PATH}"
-            )
-
     cfg = {
         "host": host,
         "port": port,
-        "user": DB_USER,
-        "password": password,
+        "user": require_env("CHECKSUM_DB_USER"),
+        "password": require_env("CHECKSUM_DB_PASSWORD"),
         "database": DATABASE_NAME,
         "connection_timeout": 10,
     }
